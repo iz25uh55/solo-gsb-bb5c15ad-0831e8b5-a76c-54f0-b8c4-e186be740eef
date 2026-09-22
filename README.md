@@ -131,6 +131,30 @@ PUBLISH_PORT=8000
 以下情况返回 **400**：指针格式非法（不以 `/` 开头等）、同一指针重复出现（按解码后的
 reference token 比较，`/a~0b` 与等价写法视为重复）。数组元素不是字符串时返回 422。
 
+### 冲突脱敏（redactPaths）
+
+审计场景下，冲突记录里的三方值本身可能就是敏感数据（密码、密钥、令牌）。请求可携带可选的
+`redactPaths`（也接受别名 `redact_paths`），值为 [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901.html)
+字符串数组，单段 `*` 通配任意一个路径段：
+
+```json
+"redactPaths": ["/db/password", "/servers/*/token"]
+```
+
+它**只影响响应 `conflicts` 的 `base` / `left` / `right`**：
+
+- 冲突指针命中规则时（含规则位于冲突指针**上方**、冲突值整体落在被脱敏子树内的情况），
+  三方值整体替换为固定字符串 `"[REDACTED]"`；
+- 冲突指针位于规则**上方**时（冲突值是包含敏感点的三方快照，例如整个对象/数组成为冲突值），
+  按规则的相对余路径在三份快照内部递归脱敏，未命中的同级字段保持可见；
+- 任一侧缺失（`null`）的分支保持 `null`——脱敏只遮蔽存在的值，不会凭空造值。
+
+`merged`、冲突判定与 `conflictResolutions` **始终使用原始值**：脱敏只是响应展示层的遮蔽，
+不改变合并结果、冲突清单（指针与 `kind`）或裁决行为。未命中任何冲突的脱敏规则不报错。
+
+以下情况返回 **400**：指针格式非法、同一指针重复出现（按解码后的 reference token 比较）。
+数组元素不是字符串时返回 422。
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -149,7 +173,8 @@ reference token 比较，`/a~0b` 与等价写法视为重复）。数组元素�
 `POST /merge`，字段 `base` / `left` / `right` 为任意 JSON 文档；
 `arrayIdentity`（也接受别名 `array_identity`）为“指针 → 字段名”映射，可省略；
 `conflictResolutions`（也接受别名 `conflict_resolutions`）为冲突裁决列表，可省略；
-`protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略。
+`protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略；
+`redactPaths`（也接受别名 `redact_paths`）为冲突脱敏指针数组，可省略。
 
 请求：
 
@@ -260,6 +285,40 @@ curl -s -X POST http://localhost:8000/merge \
 
 该冲突同样可用 `conflictResolutions` 裁决（如
 `{"pointer": "/db/password", "resolution": "left"}`）；不裁决则一直保留 base。
+
+脱敏示例（`/db/password` 的三方值在响应冲突中被遮蔽，`merged` 仍按原始值保留 base）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"db": {"host": "a", "password": "secret"}},
+    "left":  {"db": {"host": "b", "password": "rotated-left"}},
+    "right": {"db": {"host": "b", "password": "rotated-right"}},
+    "redactPaths": ["/db/password"]
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": {"db": {"host": "b", "password": "secret"}},
+  "conflicts": [
+    {
+      "pointer": "/db/password",
+      "kind": "both_modified",
+      "base": "[REDACTED]",
+      "left": "[REDACTED]",
+      "right": "[REDACTED]"
+    }
+  ]
+}
+```
+
+当冲突位于脱敏规则**上方**时，按相对路径在三方快照内部递归脱敏。例如上例改为 left 删除
+`/db`、right 修改 `/db/host`，冲突记录为 `/db`（`delete_vs_modify`），其 `base` / `right`
+快照中的 `password` 被遮蔽为 `"[REDACTED]"`、`host` 保持可见，`left` 缺失侧保持 `null`。
 
 ## 本地开发（不使用 Docker）
 

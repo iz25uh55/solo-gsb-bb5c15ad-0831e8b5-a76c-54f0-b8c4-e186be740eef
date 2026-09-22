@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.merger import Merger, json_equal, parse_pointer
+from app.merger import REDACTED, Merger, json_equal, parse_pointer, redact_conflicts
 
 
 def merge(base, left, right, identity=None):
@@ -1075,3 +1075,136 @@ def test_duplicate_or_invalid_protected_pointer_is_rejected():
         Merger(None, ["/a~0b", "/a~0b"])
     with pytest.raises(ValueError):
         Merger(None, ["a"])
+
+
+# ------------------------------------------------------------- redactPaths
+
+
+def merge_redacted(base, left, right, redact, identity=None, resolutions=None):
+    merged, conflicts = Merger(identity).merge(base, left, right, resolutions)
+    return merged, [
+        (c.path, c.kind, c.base, c.left, c.right)
+        for c in redact_conflicts(conflicts, [parse_pointer(p) for p in redact])
+    ]
+
+
+def test_redact_exact_hit_masks_all_three_values():
+    merged, conflicts = merge_redacted({"a": 1}, {"a": 2}, {"a": 3}, ["/a"])
+    assert merged == {"a": 1}  # the merge outcome keeps the original value
+    assert conflicts == [("/a", "both_modified", REDACTED, REDACTED, REDACTED)]
+
+
+def test_redact_keeps_missing_sides_null():
+    _, conflicts = merge_redacted({"a": 1}, {}, {"a": 3}, ["/a"])
+    assert conflicts == [("/a", "delete_vs_modify", REDACTED, None, REDACTED)]
+
+
+def test_redact_rule_above_the_conflict_masks_wholesale():
+    # /db covers everything beneath it, including the conflict at
+    # /db/password.
+    _, conflicts = merge_redacted(
+        {"db": {"password": "a"}},
+        {"db": {"password": "b"}},
+        {"db": {"password": "c"}},
+        ["/db"],
+    )
+    assert conflicts == [
+        ("/db/password", "both_modified", REDACTED, REDACTED, REDACTED)
+    ]
+
+
+def test_redact_rule_below_the_conflict_recurses_into_snapshots():
+    # The conflict sits above the rule: the sensitive spot is masked inside
+    # each three-way snapshot while siblings stay visible.
+    merged, conflicts = merge_redacted(
+        {"db": {"host": "a", "password": "s"}},
+        {},
+        {"db": {"host": "b", "password": "r"}},
+        ["/db/password"],
+    )
+    assert merged == {"db": {"host": "a", "password": "s"}}
+    assert conflicts == [(
+        "/db",
+        "delete_vs_modify",
+        {"host": "a", "password": REDACTED},
+        None,
+        {"host": "b", "password": REDACTED},
+    )]
+
+
+def test_redact_relative_wildcard_covers_every_list_item():
+    _, conflicts = merge_redacted(
+        {"srv": [{"pw": "x"}, {"pw": "y"}]},
+        {},
+        {"srv": [{"pw": "x2"}, {"pw": "y2"}]},
+        ["/srv/*/pw"],
+    )
+    assert conflicts == [(
+        "/srv",
+        "delete_vs_modify",
+        [{"pw": REDACTED}, {"pw": REDACTED}],
+        None,
+        [{"pw": REDACTED}, {"pw": REDACTED}],
+    )]
+
+
+def test_redact_missing_branch_inside_a_snapshot_is_left_as_is():
+    # The sensitive key exists only on the right snapshot; the walk never
+    # fabricates it on the other sides.
+    _, conflicts = merge_redacted(
+        {"db": {"host": "a"}},
+        {},
+        {"db": {"host": "b", "password": "r"}},
+        ["/db/password"],
+    )
+    assert conflicts == [(
+        "/db",
+        "delete_vs_modify",
+        {"host": "a"},
+        None,
+        {"host": "b", "password": REDACTED},
+    )]
+
+
+def test_redact_root_pattern_masks_every_conflict():
+    _, conflicts = merge_redacted(1, 2, 3, [""])
+    assert conflicts == [("", "both_modified", REDACTED, REDACTED, REDACTED)]
+
+
+def test_redact_recurses_from_a_root_conflict_into_snapshots():
+    # A scalar-versus-object divergence conflicts at the root; the rule's
+    # remainder walks into the object snapshots only.
+    _, conflicts = merge_redacted({"pw": "s"}, "x", {"pw": "r"}, ["/pw"])
+    assert conflicts == [
+        ("", "both_modified", {"pw": REDACTED}, "x", {"pw": REDACTED})
+    ]
+
+
+def test_redact_wildcard_hits_identity_array_field_conflicts():
+    merged, conflicts = merge_redacted(
+        {"srv": [{"id": "a", "pw": 1}, {"id": "b", "pw": 2}]},
+        {"srv": [{"id": "a", "pw": 10}, {"id": "b", "pw": 20}]},
+        {"srv": [{"id": "a", "pw": 100}, {"id": "b", "pw": 200}]},
+        ["/srv/*/pw"],
+        identity={"/srv": "id"},
+    )
+    assert merged == {"srv": [{"id": "a", "pw": 1}, {"id": "b", "pw": 2}]}
+    assert conflicts == [
+        ("/srv/0/pw", "both_modified", REDACTED, REDACTED, REDACTED),
+        ("/srv/1/pw", "both_modified", REDACTED, REDACTED, REDACTED),
+    ]
+
+
+def test_redact_unmatched_rule_leaves_conflicts_untouched():
+    _, conflicts = merge_redacted({"a": 1}, {"a": 2}, {"a": 3}, ["/nope"])
+    assert conflicts == [("/a", "both_modified", 1, 2, 3)]
+
+
+def test_redact_does_not_change_merged_or_resolution_outcome():
+    # Adjudication and the merged document use the original values even
+    # though the reported conflict is masked.
+    merged, conflicts = merge_redacted(
+        {"a": 1}, {"a": 2}, {"a": 3}, ["/a"], resolutions={"/a": "left"}
+    )
+    assert merged == {"a": 2}
+    assert conflicts == [("/a", "both_modified", REDACTED, REDACTED, REDACTED)]

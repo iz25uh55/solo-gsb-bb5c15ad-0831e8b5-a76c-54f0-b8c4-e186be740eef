@@ -83,6 +83,22 @@ class MergeRequest(BaseModel):
             "with HTTP 400."
         ),
     )
+    redact_paths: list[str] = Field(
+        default_factory=list,
+        alias="redactPaths",
+        description=(
+            "JSON Pointers (RFC 6901) of sensitive locations whose values "
+            "are masked as '[REDACTED]' in the response 'conflicts' "
+            "(base/left/right only). A single '*' token matches one path "
+            "segment. A conflict reported at or below a redact pointer has "
+            "its three-way values replaced wholesale; a conflict reported "
+            "above one has the pointer's relative remainder masked inside "
+            "its three-way snapshots (missing sides stay null). Redaction "
+            "never affects 'merged', conflict detection, or "
+            "conflictResolutions, which always use the original values. "
+            "Malformed or duplicate pointers are rejected with HTTP 400."
+        ),
+    )
 
 
 class Conflict(BaseModel):

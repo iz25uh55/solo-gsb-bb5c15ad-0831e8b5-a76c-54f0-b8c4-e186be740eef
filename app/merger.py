@@ -38,6 +38,13 @@ location (``"base"``, ``"left"`` or ``"right"``). Conflicts not listed keep
 the base value. The reported conflicts are unaffected by resolutions, so an
 auditor always sees the original three-way values.
 
+For display to auditors, the reported conflicts may additionally be
+*redacted*: :func:`redact_conflicts` masks the three-way values at
+configured ``redactPaths`` locations (a ``*`` token matches one segment),
+recursing into snapshots when a conflict sits above a redact pointer. The
+merge outcome, conflict detection and adjudication always use the original
+values.
+
 The merge result is deterministic for identical inputs.
 """
 
@@ -1051,6 +1058,110 @@ def parse_pointer(pointer: str) -> tuple[str, ...]:
 
 def escape_token(token: str) -> str:
     return token.replace("~", "~0").replace("/", "~1")
+
+
+#: Replacement text for conflict values masked by ``redactPaths``.
+REDACTED = "[REDACTED]"
+
+
+def redact_conflicts(
+    conflicts: list[RawConflict], patterns: list[tuple[str, ...]]
+) -> list[RawConflict]:
+    """Mask ``redactPaths``-matched values in reported conflicts.
+
+    Only the three-way values of each conflict are affected; pointers and
+    kinds are untouched, so the merge outcome and adjudication are
+    independent of redaction. A conflict located at or below a pattern has
+    its three values replaced wholesale by :data:`REDACTED`; a conflict
+    above a pattern has the pattern's relative remainder applied inside
+    each three-way snapshot (``*`` matches one segment there too). Missing
+    sides (``null``) stay ``null`` and the walk never fabricates values.
+    """
+    if not patterns:
+        return conflicts
+    redacted: list[RawConflict] = []
+    for conflict in conflicts:
+        tokens = parse_pointer(conflict.path)
+        if any(_pattern_covers(pattern, tokens) for pattern in patterns):
+            redacted.append(
+                conflict._replace(
+                    base=_redact_hit(conflict.base),
+                    left=_redact_hit(conflict.left),
+                    right=_redact_hit(conflict.right),
+                )
+            )
+            continue
+        relatives = [
+            pattern[len(tokens):]
+            for pattern in patterns
+            if len(pattern) > len(tokens)
+            and _segments_match(pattern[: len(tokens)], tokens)
+        ]
+        if not relatives:
+            redacted.append(conflict)
+            continue
+        redacted.append(
+            conflict._replace(
+                base=_redact_inside(conflict.base, relatives),
+                left=_redact_inside(conflict.left, relatives),
+                right=_redact_inside(conflict.right, relatives),
+            )
+        )
+    return redacted
+
+
+def _segments_match(pattern: tuple[str, ...], tokens: tuple[str, ...]) -> bool:
+    """Segment-wise match; a ``"*"`` pattern token matches any one token."""
+    return all(p == "*" or p == t for p, t in zip(pattern, tokens))
+
+
+def _pattern_covers(pattern: tuple[str, ...], tokens: tuple[str, ...]) -> bool:
+    """Whether *pattern* matches *tokens* or an ancestor of them."""
+    return len(pattern) <= len(tokens) and _segments_match(
+        pattern, tokens[: len(pattern)]
+    )
+
+
+def _redact_hit(value: Any) -> Any:
+    """Wholesale redaction of a hit value; a missing side stays ``None``."""
+    return None if value is None else REDACTED
+
+
+def _redact_inside(value: Any, relatives: list[tuple[str, ...]]) -> Any:
+    for rel in relatives:
+        value = _redact_at(value, rel)
+    return value
+
+
+def _redact_at(value: Any, rel: tuple[str, ...]) -> Any:
+    """Redact *value* (a conflict snapshot) at relative pattern *rel*.
+
+    The walk never fabricates data: a branch that is missing, ``null`` or
+    not traversable is left exactly as it is.
+    """
+    if value is None:
+        return None
+    if not rel:
+        return REDACTED
+    head, rest = rel[0], rel[1:]
+    if isinstance(value, dict):
+        if head == "*":
+            return {key: _redact_at(item, rest) for key, item in value.items()}
+        if head not in value:
+            return value
+        updated = dict(value)
+        updated[head] = _redact_at(value[head], rest)
+        return updated
+    if isinstance(value, list):
+        if head == "*":
+            return [_redact_at(item, rest) for item in value]
+        index = _array_index(head)
+        if index is None or index >= len(value):
+            return value
+        updated = list(value)
+        updated[index] = _redact_at(value[index], rest)
+        return updated
+    return value
 
 
 def json_equal(a: Any, b: Any) -> bool:

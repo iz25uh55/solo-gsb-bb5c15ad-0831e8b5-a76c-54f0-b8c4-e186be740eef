@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .config import settings
-from .merger import Merger, parse_pointer
+from .merger import Merger, parse_pointer, redact_conflicts
 from .middleware import RequestSizeLimitMiddleware
 from .models import Conflict, MergeRequest, MergeResponse
 
@@ -23,9 +23,15 @@ app = FastAPI(
         "may be adjudicated per request via 'conflictResolutions', which "
         "maps a conflict pointer to the winning side (base, left or "
         "right); explicit adjudication also overrides protected paths. "
-        "The response conflicts always keep the original three-way values."
+        "'redactPaths' masks sensitive values in the response conflicts "
+        "only: a conflict at or below a redact pointer has its three-way "
+        "values replaced with '[REDACTED]', and a conflict above one has "
+        "the pointer's relative remainder masked inside its three-way "
+        "snapshots (missing sides stay null). The merge outcome, conflict "
+        "detection and adjudication always use the original values; the "
+        "response conflicts always keep the original pointers and kinds."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -79,6 +85,27 @@ async def merge(request: MergeRequest) -> MergeResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # Redact pointers must be well-formed and unique (by decoded reference
+    # tokens, so escaped spellings of the same pointer collide). Redaction
+    # only shapes the response conflicts, so it never reaches the merger.
+    redact_patterns: list[tuple[str, ...]] = []
+    redact_seen: set[tuple[str, ...]] = set()
+    for pointer in request.redact_paths:
+        try:
+            tokens = parse_pointer(pointer)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid redactPaths pointer {pointer!r}: {exc}",
+            ) from exc
+        if tokens in redact_seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"duplicate redactPaths entry for pointer {pointer!r}",
+            )
+        redact_seen.add(tokens)
+        redact_patterns.append(tokens)
+
     # Validate resolution pointers up front: they must be well-formed and
     # unique (by decoded reference tokens, so escaped spellings of the same
     # pointer collide). Whether each pointer denotes a real conflict can
@@ -118,6 +145,6 @@ async def merge(request: MergeRequest) -> MergeResponse:
             left=conflict.left,
             right=conflict.right,
         )
-        for conflict in raw_conflicts
+        for conflict in redact_conflicts(raw_conflicts, redact_patterns)
     ]
     return MergeResponse(merged=merged, conflicts=conflicts)
