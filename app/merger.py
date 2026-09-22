@@ -38,6 +38,15 @@ location (``"base"``, ``"left"`` or ``"right"``). Conflicts not listed keep
 the base value. The reported conflicts are unaffected by resolutions, so an
 auditor always sees the original three-way values.
 
+Callers may pass *redact paths* (RFC 6901 pointers, ``*`` matching a single
+token) to mask sensitive values in the reported conflicts: a conflict
+reported at or below a redact path has its three-way values replaced with
+the fixed string ``"[REDACTED]"``, and a redact path reaching below a
+reported conflict is applied recursively inside the three-way snapshots.
+Sides on which the location is absent stay ``null``. Redaction only
+rewrites the returned conflicts -- the merged document, conflict detection
+and resolutions always use the original values.
+
 The merge result is deterministic for identical inputs.
 """
 
@@ -53,6 +62,9 @@ JsonValue = Optional[Any]
 # Sentinel meaning "the key / item is absent on this side".  It is distinct
 # from JSON ``null`` during the merge but rendered as ``null`` in responses.
 MISSING: Any = object()
+
+#: Fixed replacement string for conflict values masked by redactPaths.
+REDACTED = "[REDACTED]"
 
 
 class IdMarker(NamedTuple):
@@ -81,6 +93,7 @@ class Merger:
         self,
         identity_map: Optional[dict[str, str]] = None,
         protected_paths: Optional[list[str]] = None,
+        redact_paths: Optional[list[str]] = None,
     ) -> None:
         # Exact-pointer config, keyed by token tuple.
         self._exact: dict[tuple[str, ...], str] = {}
@@ -117,6 +130,20 @@ class Merger:
                 self._protected_exact.add(tokens)
         self._protected_wild.sort(key=lambda t: (-sum(x != "*" for x in t), -len(t), t))
 
+        # Redact paths: response-only masking of reported conflict values.
+        # Matched like protected paths ("*" tokens included), but applied
+        # after all merge passes, so they cannot change the outcome.
+        self._redact_rules: list[tuple[str, ...]] = []
+        redact_seen: set[tuple[str, ...]] = set()
+        for pointer in redact_paths or []:
+            tokens = parse_pointer(pointer)
+            if tokens in redact_seen:
+                raise ValueError(
+                    f"duplicate redactPaths entry for pointer {pointer!r}"
+                )
+            redact_seen.add(tokens)
+            self._redact_rules.append(tokens)
+
     # ------------------------------------------------------------------ API
 
     #: Values accepted in a *resolutions* mapping.
@@ -142,6 +169,10 @@ class Merger:
         unknown sides raise :class:`ValueError`. The returned conflicts
         (pointers and three-way values) are identical to a run without
         resolutions.
+
+        Values matched by the merger's redact paths are masked in the
+        returned conflicts only; *merged* and conflict detection always
+        use the original values.
         """
         # Pass 1: plain merge. Its output locates where every change ends
         # up, and a parallel walk enumerates every changed logical path so
@@ -214,16 +245,23 @@ class Merger:
             zip(resolved, raw),
             key=lambda pair: (pair[0], pair[1].kind),
         )
-        final_conflicts = [
-            RawConflict(
-                kind=conflict.kind,
-                path=path,
-                base=_public(conflict.base),
-                left=_public(conflict.left),
-                right=_public(conflict.right),
+        # Redaction is the very last step and touches only the reported
+        # three-way values, so it cannot change the merged document, the
+        # conflict set, or how resolutions apply.
+        final_conflicts = []
+        for path, conflict in ordered:
+            base_value, left_value, right_value = self._redact_conflict(
+                parse_pointer(path), conflict.base, conflict.left, conflict.right
             )
-            for path, conflict in ordered
-        ]
+            final_conflicts.append(
+                RawConflict(
+                    kind=conflict.kind,
+                    path=path,
+                    base=_public(base_value),
+                    left=_public(left_value),
+                    right=_public(right_value),
+                )
+            )
         return merged, final_conflicts
 
     def _merge_pass(
@@ -971,6 +1009,44 @@ class Merger:
         """
         return [_render_path(kept, plain, base, path) for path in paths]
 
+    # ---------------------------------------------------------- redaction
+
+    def _redact_conflict(
+        self, tokens: tuple[str, ...], base: Any, left: Any, right: Any
+    ) -> tuple[Any, Any, Any]:
+        """Mask a reported conflict's three-way values per redactPaths.
+
+        A rule matching the conflict location or one of its ancestors
+        replaces every present side wholesale; a rule reaching below the
+        conflict location is applied inside the three-way snapshots by
+        its relative remainder. Absent sides (MISSING) always stay
+        absent, so a deletion still reports ``null``.
+        """
+        if not self._redact_rules:
+            return base, left, right
+        for rule in self._redact_rules:
+            if len(rule) <= len(tokens) and _tokens_match(
+                rule, tokens[: len(rule)]
+            ):
+                return (
+                    _redact_wholesale(base),
+                    _redact_wholesale(left),
+                    _redact_wholesale(right),
+                )
+        relatives = [
+            rule[len(tokens):]
+            for rule in self._redact_rules
+            if len(rule) > len(tokens)
+            and _tokens_match(rule[: len(tokens)], tokens)
+        ]
+        if not relatives:
+            return base, left, right
+        return (
+            _redact_within(base, relatives),
+            _redact_within(left, relatives),
+            _redact_within(right, relatives),
+        )
+
 
 # Sentinel: an identity-array item path carried no protection this pass.
 _UNGUARDED: Any = object()
@@ -1175,6 +1251,62 @@ def _sort_key(value: Any):
 def _public(value: Any) -> Any:
     """Render an internal value for the API response (MISSING -> null)."""
     return None if value is MISSING else value
+
+
+def _tokens_match(pattern: tuple[str, ...], concrete: tuple[str, ...]) -> bool:
+    """Whether a redact pattern (``"*"`` matches one segment) matches a
+    concrete path of the same length."""
+    return len(pattern) == len(concrete) and all(
+        p == "*" or p == c for p, c in zip(pattern, concrete)
+    )
+
+
+def _redact_wholesale(value: Any) -> Any:
+    """Mask a whole conflict side; an absent side stays absent."""
+    return MISSING if value is MISSING else REDACTED
+
+
+def _redact_within(value: Any, patterns: list[tuple[str, ...]]) -> Any:
+    """Mask every location the relative *patterns* address inside a
+    reported three-way snapshot. An absent side stays absent."""
+    if value is MISSING:
+        return MISSING
+    for pattern in patterns:
+        value = _redact_descend(value, pattern)
+    return value
+
+
+def _redact_descend(value: Any, pattern: tuple[str, ...]) -> Any:
+    """Copy of *value* with each location addressed by *pattern* masked.
+
+    ``"*"`` matches any single object key or array index. Branches the
+    pattern cannot follow (absent key, out-of-range index, a scalar on
+    the way) keep their original value. The input is never mutated: the
+    snapshots may be shared with the merged document.
+    """
+    if not pattern:
+        return REDACTED
+    token, rest = pattern[0], pattern[1:]
+    if isinstance(value, dict):
+        if token == "*":
+            return {
+                key: _redact_descend(item, rest) for key, item in value.items()
+            }
+        if token in value:
+            return {**value, token: _redact_descend(value[token], rest)}
+        return value
+    if isinstance(value, list):
+        if token == "*":
+            return [_redact_descend(item, rest) for item in value]
+        index = _array_index(token)
+        if index is not None and index < len(value):
+            return (
+                value[:index]
+                + [_redact_descend(value[index], rest)]
+                + value[index + 1:]
+            )
+        return value
+    return value
 
 
 def _resolve_outcome(

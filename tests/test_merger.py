@@ -1075,3 +1075,201 @@ def test_duplicate_or_invalid_protected_pointer_is_rejected():
         Merger(None, ["/a~0b", "/a~0b"])
     with pytest.raises(ValueError):
         Merger(None, ["a"])
+
+
+# --------------------------------------------------------------- redactPaths
+
+
+def merge_redacted(base, left, right, redact, identity=None, resolutions=None):
+    merged, conflicts = Merger(identity, None, redact).merge(
+        base, left, right, resolutions
+    )
+    return merged, [
+        (c.path, c.kind, c.base, c.left, c.right) for c in conflicts
+    ]
+
+
+def test_redact_exact_match_masks_three_way_values():
+    merged, conflicts = merge_redacted({"a": 1}, {"a": 2}, {"a": 3}, ["/a"])
+    # merged keeps the original values; only the report is masked.
+    assert merged == {"a": 1}
+    assert conflicts == [
+        ("/a", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]")
+    ]
+
+
+def test_redact_absent_side_stays_null():
+    _, conflicts = merge_redacted({"a": 1}, {}, {"a": 3}, ["/a"])
+    assert conflicts == [
+        ("/a", "delete_vs_modify", "[REDACTED]", None, "[REDACTED]")
+    ]
+
+    _, conflicts = merge_redacted({}, {"a": 1}, {"a": 2}, ["/a"])
+    assert conflicts == [("/a", "both_added", None, "[REDACTED]", "[REDACTED]")]
+
+
+def test_redact_present_null_value_is_masked():
+    # A genuine JSON null is a present value, not an absent side.
+    _, conflicts = merge_redacted({"a": None}, {"a": 1}, {"a": 2}, ["/a"])
+    assert conflicts == [
+        ("/a", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]")
+    ]
+
+
+def test_redact_rule_above_conflict_masks_wholesale():
+    _, conflicts = merge_redacted(
+        {"o": {"a": 1}}, {"o": {"a": 2}}, {"o": {"a": 3}}, ["/o"]
+    )
+    assert conflicts == [
+        ("/o/a", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]")
+    ]
+
+
+def test_redact_rule_below_conflict_recurses_into_snapshots():
+    base = {"o": {"secret": "s0", "host": "h0"}}
+    left = {"o": {"secret": "s1", "host": "h1"}}
+    right = {}  # deletes o
+    merged, conflicts = merge_redacted(base, left, right, ["/o/secret"])
+    assert merged == base
+    assert conflicts == [
+        ("/o", "delete_vs_modify",
+         {"secret": "[REDACTED]", "host": "h0"},
+         {"secret": "[REDACTED]", "host": "h1"},
+         None),
+    ]
+
+
+def test_redact_descent_skips_branches_missing_from_a_snapshot():
+    base = {"o": {"a": 1}}
+    left = {"o": {"a": 2, "secret": "s"}}
+    right = {}  # deletes o
+    merged, conflicts = merge_redacted(base, left, right, ["/o/secret"])
+    assert merged == base
+    # base's snapshot has no "secret" branch: it is left untouched.
+    assert conflicts == [
+        ("/o", "delete_vs_modify",
+         {"a": 1}, {"a": 2, "secret": "[REDACTED]"}, None),
+    ]
+
+
+def test_redact_wildcard_inside_snapshot_covers_every_member():
+    base = {"o": {"items": [{"v": 1}, {"v": 2}]}}
+    left = {"o": {"items": [{"v": 9}, {"v": 2}]}}
+    right = {"o": {"items": [{"v": 1}, {"v": 8}]}}
+    merged, conflicts = merge_redacted(base, left, right, ["/o/items/*/v"])
+    # Plain arrays are atomic: the conflict sits at /o/items with whole
+    # arrays; the wildcard masks every item's "v" inside the snapshots.
+    assert merged == base
+    assert conflicts == [
+        ("/o/items", "both_modified",
+         [{"v": "[REDACTED]"}, {"v": "[REDACTED]"}],
+         [{"v": "[REDACTED]"}, {"v": "[REDACTED]"}],
+         [{"v": "[REDACTED]"}, {"v": "[REDACTED]"}]),
+    ]
+
+
+def test_redact_identity_array_item_conflict_by_final_pointer():
+    base = {"s": [{"id": "a", "v": 1}]}
+    left = {"s": []}  # deletes a
+    right = {"s": [{"id": "a", "v": 99}]}
+    merged, conflicts = merge_redacted(base, left, right, ["/s/*/v"], {"/s": "id"})
+    assert merged == base
+    assert conflicts == [
+        ("/s/0", "delete_vs_modify",
+         {"id": "a", "v": "[REDACTED]"}, None, {"id": "a", "v": "[REDACTED]"}),
+    ]
+
+    # A rule matching the item itself masks the whole item.
+    _, conflicts = merge_redacted(base, left, right, ["/s/*"], {"/s": "id"})
+    assert conflicts == [
+        ("/s/0", "delete_vs_modify", "[REDACTED]", None, "[REDACTED]")
+    ]
+
+
+def test_redact_both_added_item_on_parent_array():
+    # The both_added conflict is reported on the parent array with the
+    # divergent items as values; a rule on the array masks them wholesale.
+    base = {"s": []}
+    left = {"s": [{"id": "n", "v": 1}]}
+    right = {"s": [{"id": "n", "v": 2}]}
+    merged, conflicts = merge_redacted(base, left, right, ["/s"], {"/s": "id"})
+    assert merged == {"s": [{"id": "n", "v": 1}]}
+    assert conflicts == [("/s", "both_added", None, "[REDACTED]", "[REDACTED]")]
+
+
+def test_redact_root_pointer_masks_every_conflict():
+    _, conflicts = merge_redacted({"a": 1}, {"a": 2}, {"a": 3}, [""])
+    assert conflicts == [
+        ("/a", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]")
+    ]
+
+
+def test_redact_escaped_tokens_match():
+    _, conflicts = merge_redacted(
+        {"a/b": 1}, {"a/b": 2}, {"a/b": 3}, ["/a~1b"]
+    )
+    assert conflicts == [
+        ("/a~1b", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]")
+    ]
+
+
+def test_redact_does_not_change_merged_or_conflict_set():
+    base = {"a": 1, "b": 1}
+    left = {"a": 2, "b": 2}
+    right = {"a": 3, "b": 3}
+    plain_merged, plain = Merger().merge(base, left, right)
+    redacted_merged, redacted = Merger(None, None, ["/a"]).merge(base, left, right)
+    assert redacted_merged == plain_merged
+    assert [(c.path, c.kind) for c in redacted] == [
+        (c.path, c.kind) for c in plain
+    ]
+    by_pointer = {c.path: c for c in redacted}
+    assert by_pointer["/a"].left == "[REDACTED]"
+    assert by_pointer["/b"].left == 2  # unmatched conflict untouched
+
+
+def test_redact_leaves_inputs_and_merged_untouched():
+    base = {"o": {"secret": "s0", "x": 1}}
+    left = {"o": {"secret": "s1", "x": 2}}
+    right = {"o": {"secret": "s2", "x": 3}}
+    merged, conflicts = merge_redacted(base, left, right, ["/o/secret"])
+    # Both fields conflict; merged keeps base with the ORIGINAL values...
+    assert merged == {"o": {"secret": "s0", "x": 1}}
+    # ... and redaction never mutates the input documents.
+    assert base == {"o": {"secret": "s0", "x": 1}}
+    assert left == {"o": {"secret": "s1", "x": 2}}
+    assert right == {"o": {"secret": "s2", "x": 3}}
+    assert conflicts == [
+        ("/o/secret", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]"),
+        ("/o/x", "both_modified", 1, 2, 3),
+    ]
+
+
+def test_redact_still_allows_resolutions_with_original_values():
+    merged, conflicts = merge_redacted(
+        {"a": 1}, {"a": 2}, {"a": 3}, ["/a"], resolutions={"/a": "right"}
+    )
+    assert merged == {"a": 3}
+    assert conflicts == [
+        ("/a", "both_modified", "[REDACTED]", "[REDACTED]", "[REDACTED]")
+    ]
+
+
+def test_redact_composes_with_protected_paths():
+    merged, conflicts = Merger(None, ["/a"], ["/a"]).merge(
+        {"a": 1}, {"a": 9}, {"a": 9}
+    )
+    assert merged == {"a": 1}
+    assert [
+        (c.path, c.kind, c.base, c.left, c.right) for c in conflicts
+    ] == [("/a", "protected_change", "[REDACTED]", "[REDACTED]", "[REDACTED]")]
+
+
+def test_duplicate_or_invalid_redact_pointer_is_rejected():
+    with pytest.raises(ValueError, match="duplicate redactPaths"):
+        Merger(None, None, ["/a", "/a"])
+    # Escaped spellings decoding to the same tokens collide.
+    with pytest.raises(ValueError, match="duplicate redactPaths"):
+        Merger(None, None, ["/~~", "/~0~0"])
+    with pytest.raises(ValueError):
+        Merger(None, None, ["a"])

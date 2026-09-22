@@ -131,6 +131,24 @@ PUBLISH_PORT=8000
 以下情况返回 **400**：指针格式非法（不以 `/` 开头等）、同一指针重复出现（按解码后的
 reference token 比较，`/a~0b` 与等价写法视为重复）。数组元素不是字符串时返回 422。
 
+### 冲突值脱敏（redactPaths）
+
+冲突记录的 `base` / `left` / `right` 可能包含口令、密钥等敏感值。请求可携带可选的
+`redactPaths`（也接受别名 `redact_paths`），值为 [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901.html)
+字符串数组（单段 `*` 通配任意一个路径段），**只改写响应 `conflicts` 中的三方值**：
+
+- 冲突指针命中某条规则、或位于规则之下时，该冲突的三方值**整体**替换为固定字符串
+  `[REDACTED]`；
+- 冲突指针是某条规则的祖先时，按规则的相对余下路径在三方快照内部**递归脱敏**
+  （对象按键、数组按下标、`*` 遍历全部成员），未命中的字段保持原值；
+- 某侧**缺失**（被删除或从未存在，响应中显示为 `null`）的分支保持 `null`，不替换；
+  真实存在的 JSON `null` 值视为存在的值，命中时同样替换为 `[REDACTED]`；
+- `merged`、冲突判定与 `conflictResolutions` **始终使用原始值**：脱敏不改变合并结果，
+  裁决仍按原报告指针进行。
+
+以下情况返回 **400**：指针格式非法、同一指针重复出现（按解码后的 reference token 比较）。
+数组元素不是字符串时返回 422。
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -149,7 +167,8 @@ reference token 比较，`/a~0b` 与等价写法视为重复）。数组元素�
 `POST /merge`，字段 `base` / `left` / `right` 为任意 JSON 文档；
 `arrayIdentity`（也接受别名 `array_identity`）为“指针 → 字段名”映射，可省略；
 `conflictResolutions`（也接受别名 `conflict_resolutions`）为冲突裁决列表，可省略；
-`protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略。
+`protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略；
+`redactPaths`（也接受别名 `redact_paths`）为冲突值脱敏指针数组，可省略。
 
 请求：
 
@@ -260,6 +279,66 @@ curl -s -X POST http://localhost:8000/merge \
 
 该冲突同样可用 `conflictResolutions` 裁决（如
 `{"pointer": "/db/password", "resolution": "left"}`）；不裁决则一直保留 base。
+
+脱敏示例（冲突的三方值被替换为 `[REDACTED]`，`merged` 仍是原始值）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"db": {"host": "a", "password": "old"}},
+    "left":  {"db": {"host": "b", "password": "new-left"}},
+    "right": {"db": {"host": "b", "password": "new-right"}},
+    "redactPaths": ["/db/password"]
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": {"db": {"host": "b", "password": "old"}},
+  "conflicts": [
+    {
+      "pointer": "/db/password",
+      "kind": "both_modified",
+      "base": "[REDACTED]",
+      "left": "[REDACTED]",
+      "right": "[REDACTED]"
+    }
+  ]
+}
+```
+
+当冲突位于脱敏规则的祖先时，按相对路径在三方快照内部递归脱敏（删除侧保持 `null`）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"db": {"host": "a", "password": "old"}},
+    "left":  {"db": {"host": "b", "password": "new-left"}},
+    "right": {},
+    "redactPaths": ["/db/password"]
+  }'
+```
+
+响应（`/db` 整体冲突，`password` 字段在快照内部被脱敏，`merged` 保留 base 原值）：
+
+```json
+{
+  "merged": {"db": {"host": "a", "password": "old"}},
+  "conflicts": [
+    {
+      "pointer": "/db",
+      "kind": "delete_vs_modify",
+      "base": {"host": "a", "password": "[REDACTED]"},
+      "left": {"host": "b", "password": "[REDACTED]"},
+      "right": null
+    }
+  ]
+}
+```
 
 ## 本地开发（不使用 Docker）
 

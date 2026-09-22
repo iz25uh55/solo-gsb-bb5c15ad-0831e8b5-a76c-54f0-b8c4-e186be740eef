@@ -62,7 +62,8 @@ class MergeRequest(BaseModel):
             "conflict pointer to the winning side; conflicts not listed keep "
             "the base value. Malformed, duplicated, or non-conflict pointers "
             "are rejected with HTTP 400. The response 'conflicts' always "
-            "report the original three-way values."
+            "report the original three-way values (unless masked via "
+            "'redactPaths')."
         ),
     )
     protected_paths: list[str] = Field(
@@ -81,6 +82,24 @@ class MergeRequest(BaseModel):
             "overrides the protection; unresolved protected conflicts keep "
             "the base value. Malformed or duplicate pointers are rejected "
             "with HTTP 400."
+        ),
+    )
+    redact_paths: list[str] = Field(
+        default_factory=list,
+        alias="redactPaths",
+        description=(
+            "JSON Pointers (RFC 6901) of locations whose values are "
+            "sensitive and must be masked in the response 'conflicts'. A "
+            "single '*' token matches one path segment. A conflict "
+            "reported at or below a listed pointer has its "
+            "base/left/right values replaced with the fixed string "
+            "'[REDACTED]'; a pointer reaching below a reported conflict "
+            "is applied recursively inside the three-way snapshots. "
+            "Sides on which the location is absent stay null. Redaction "
+            "only rewrites the reported conflicts: 'merged', conflict "
+            "detection and 'conflictResolutions' always use the original "
+            "values. Malformed or duplicate pointers are rejected with "
+            "HTTP 400."
         ),
     )
 

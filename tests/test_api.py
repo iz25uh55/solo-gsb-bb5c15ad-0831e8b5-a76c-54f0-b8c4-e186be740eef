@@ -545,6 +545,215 @@ def test_protected_paths_appear_in_openapi_schema():
     assert "protected_change" in conflict_props["kind"]["description"]
 
 
+# --------------------------------------------------------------- redactPaths
+
+
+def test_redact_paths_masks_exact_conflict_values():
+    payload = {
+        "base": {"db": {"host": "a", "password": "old"}},
+        "left": {"db": {"host": "b", "password": "new-left"}},
+        "right": {"db": {"host": "b", "password": "new-right"}},
+        "redactPaths": ["/db/password"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    # merged keeps the original values; only the reported conflict is masked.
+    assert body["merged"] == {"db": {"host": "b", "password": "old"}}
+    assert body["conflicts"] == [
+        {"pointer": "/db/password", "kind": "both_modified",
+         "base": "[REDACTED]", "left": "[REDACTED]", "right": "[REDACTED]"}
+    ]
+
+
+def test_redact_paths_missing_branch_stays_null():
+    payload = {
+        "base": {"a": 1},
+        "left": {},  # deletes a
+        "right": {"a": 3},
+        "redactPaths": ["/a"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 1}
+    assert body["conflicts"] == [
+        {"pointer": "/a", "kind": "delete_vs_modify",
+         "base": "[REDACTED]", "left": None, "right": "[REDACTED]"}
+    ]
+
+
+def test_redact_paths_recurses_into_ancestor_conflict():
+    payload = {
+        "base": {"db": {"host": "a", "password": "old"}},
+        "left": {"db": {"host": "b", "password": "new-left"}},
+        "right": {},  # deletes db
+        "redactPaths": ["/db/password"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    # The whole /db object conflicts; the rule reaches inside the snapshots.
+    assert body["merged"] == {"db": {"host": "a", "password": "old"}}
+    assert body["conflicts"] == [
+        {
+            "pointer": "/db",
+            "kind": "delete_vs_modify",
+            "base": {"host": "a", "password": "[REDACTED]"},
+            "left": {"host": "b", "password": "[REDACTED]"},
+            "right": None,
+        }
+    ]
+
+
+def test_redact_paths_rule_above_conflict_masks_wholesale():
+    payload = {
+        "base": {"db": {"password": "old"}},
+        "left": {"db": {"password": "new-left"}},
+        "right": {"db": {"password": "new-right"}},
+        "redactPaths": ["/db"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    assert response.json()["conflicts"] == [
+        {"pointer": "/db/password", "kind": "both_modified",
+         "base": "[REDACTED]", "left": "[REDACTED]", "right": "[REDACTED]"}
+    ]
+
+
+def test_redact_paths_wildcard_matches_identity_array_items():
+    payload = {
+        "base": {"servers": [{"id": "a", "password": "p0"}]},
+        "left": {"servers": []},  # deletes a
+        "right": {"servers": [{"id": "a", "password": "p1"}]},
+        "arrayIdentity": {"/servers": "id"},
+        "redactPaths": ["/servers/*/password"],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == payload["base"]
+    assert body["conflicts"] == [
+        {
+            "pointer": "/servers/0",
+            "kind": "delete_vs_modify",
+            "base": {"id": "a", "password": "[REDACTED]"},
+            "left": None,
+            "right": {"id": "a", "password": "[REDACTED]"},
+        }
+    ]
+
+
+def test_redact_paths_does_not_change_merged_or_resolutions():
+    payload = {
+        "base": {"a": 1},
+        "left": {"a": 2},
+        "right": {"a": 3},
+        "redactPaths": ["/a"],
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    # Adjudication still uses the original values and pointers.
+    assert body["merged"] == {"a": 3}
+    assert body["conflicts"] == [
+        {"pointer": "/a", "kind": "both_modified",
+         "base": "[REDACTED]", "left": "[REDACTED]", "right": "[REDACTED]"}
+    ]
+
+
+def test_redact_paths_accepts_snake_case_alias():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 3},
+            "redact_paths": ["/a"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["conflicts"][0]["base"] == "[REDACTED]"
+
+
+def test_redact_paths_without_conflicts_is_a_noop():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 1},
+            "redactPaths": ["/a"],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 2}
+    assert body["conflicts"] == []
+
+
+def test_invalid_redact_pointer_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 1},
+            "redactPaths": ["a"],  # missing leading slash
+        },
+    )
+    assert response.status_code == 400
+    assert "redactPaths" in response.json()["detail"]
+
+
+def test_duplicate_redact_pointer_returns_400():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 1},
+            "redactPaths": ["/a", "/a"],
+        },
+    )
+    assert response.status_code == 400
+    assert "duplicate redactPaths" in response.json()["detail"]
+
+    # Escaped spellings decoding to the same tokens collide too.
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 1},
+            "redactPaths": ["/~~", "/~0~0"],
+        },
+    )
+    assert response.status_code == 400
+    assert "duplicate redactPaths" in response.json()["detail"]
+
+
+def test_redact_paths_entry_must_be_a_string():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 1},
+            "redactPaths": [1],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_redact_paths_appear_in_openapi_schema():
+    schema = client.get("/openapi.json").json()
+    properties = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "redactPaths" in properties
+    assert "[REDACTED]" in properties["redactPaths"]["description"]
+
+
 # ------------------------------------------------------------- size limiting
 
 

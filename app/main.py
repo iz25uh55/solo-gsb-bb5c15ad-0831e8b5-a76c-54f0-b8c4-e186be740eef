@@ -23,9 +23,14 @@ app = FastAPI(
         "may be adjudicated per request via 'conflictResolutions', which "
         "maps a conflict pointer to the winning side (base, left or "
         "right); explicit adjudication also overrides protected paths. "
-        "The response conflicts always keep the original three-way values."
+        "'redactPaths' masks sensitive values in the reported conflicts "
+        "only: base/left/right values at (or below) a listed pointer are "
+        "replaced with '[REDACTED]', while 'merged', conflict detection "
+        "and adjudication keep using the original values. Without "
+        "redaction the response conflicts always keep the original "
+        "three-way values."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -74,8 +79,28 @@ async def merge(request: MergeRequest) -> MergeResponse:
             )
         protected_seen.add(tokens)
 
+    # Redact pointers must be well-formed and unique (by decoded
+    # reference tokens, so escaped spellings of the same pointer collide).
+    redact_seen: set[tuple[str, ...]] = set()
+    for pointer in request.redact_paths:
+        try:
+            tokens = parse_pointer(pointer)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid redactPaths pointer {pointer!r}: {exc}",
+            ) from exc
+        if tokens in redact_seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"duplicate redactPaths entry for pointer {pointer!r}",
+            )
+        redact_seen.add(tokens)
+
     try:
-        merger = Merger(request.array_identity, request.protected_paths)
+        merger = Merger(
+            request.array_identity, request.protected_paths, request.redact_paths
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
